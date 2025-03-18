@@ -33,19 +33,31 @@ type Group struct {
 var (
 	mu     sync.RWMutex
 	groups = make(map[string]*Group)
+	// 默认使用LRU策略
+	defaultStrategyFactory = NewLRUCache
 )
 
+// NewGroup 创建一个新的缓存命名空间，使用默认缓存策略
 func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
+	return NewGroupWithStrategy(name, cacheBytes, getter, defaultStrategyFactory)
+}
+
+// NewGroupWithStrategy 创建一个使用指定缓存策略的缓存命名空间
+func NewGroupWithStrategy(name string, cacheBytes int64, getter Getter, factory CacheStrategyFactory) *Group {
 	if getter == nil {
 		panic("getter is nil!")
 	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: cache{cacheBytes: cacheBytes},
-		loader:    &singleFlight.Group{},
+		name:   name,
+		getter: getter,
+		mainCache: cache{
+			cacheBytes: cacheBytes,
+			factory:    factory,
+		},
+		loader: &singleFlight.Group{},
 	}
 	groups[name] = g
 	return g

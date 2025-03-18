@@ -1,34 +1,31 @@
 package geeCache
 
 import (
-	"github.com/lyb88999/geeCache/geeCache/lru"
 	"sync"
 )
 
 type cache struct {
 	mu         sync.Mutex
-	lru        *lru.Cache
+	strategy   CacheStrategy // 替换原来的 lru 对象
 	cacheBytes int64
+	factory    CacheStrategyFactory // 工厂函数，用于创建缓存策略
 }
 
 func (c *cache) add(key string, value ByteView) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// 延迟初始化
-	if c.lru == nil {
-		c.lru = lru.New(c.cacheBytes, nil)
+	if c.strategy == nil {
+		c.strategy = c.factory(c.cacheBytes, nil)
 	}
-	c.lru.Add(key, value)
+	c.strategy.Add(key, value)
 }
 
 func (c *cache) get(key string) (value ByteView, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.lru == nil {
+	if c.strategy == nil {
 		return
 	}
-	if v, ok := c.lru.Get(key); ok {
-		return v.(ByteView), ok
-	}
-	return
+	return c.strategy.Get(key)
 }
