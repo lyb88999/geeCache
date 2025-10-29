@@ -43,6 +43,29 @@ func (m *Map) Add(keys ...string) {
 	sort.Ints(m.keys)
 }
 
+func (m *Map) Remove(key string) {
+	if key == "" {
+		return
+	}
+
+	// 1. 收集需要删除的虚拟节点hash值
+	toRemove := make(map[int]bool)
+	for i := 0; i < m.replicas; i++ {
+		hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
+		toRemove[hash] = true
+		delete(m.hashMap, hash)
+	}
+
+	// 2. 从keys切片中移除这些值
+	newKeys := make([]int, 0, len(m.keys))
+	for _, k := range m.keys {
+		if !toRemove[k] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	m.keys = newKeys
+}
+
 // Get 选择节点的Get方法
 func (m *Map) Get(key string) string {
 	if len(m.keys) == 0 {
