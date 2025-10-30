@@ -29,3 +29,23 @@ func (c *cache) get(key string) (value ByteView, ok bool) {
 	}
 	return c.strategy.Get(key)
 }
+
+// clear 清空缓存
+func (c *cache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 重新创建策略实例，相当于清空
+	if c.strategy != nil {
+		c.strategy = c.factory(c.cacheBytes, nil)
+	}
+}
+
+// len 返回缓存项数
+func (c *cache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.strategy == nil {
+		return 0
+	}
+	return c.strategy.Len()
+}

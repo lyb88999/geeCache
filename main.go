@@ -79,9 +79,9 @@ func main() {
 	addr := fmt.Sprintf("http://localhost:%d", cfg.Server.Port)
 
 	// 初始化重试器
-	var retryer *retry.Retryer
+	var _ *retry.Retryer
 	if cfg.Retry.Enabled {
-		retryer = retry.NewRetryer(&retry.Config{
+		_ = retry.NewRetryer(&retry.Config{
 			MaxRetries:     cfg.Retry.MaxRetries,
 			InitialBackoff: time.Duration(cfg.Retry.InitialBackoff) * time.Millisecond,
 			MaxBackoff:     time.Duration(cfg.Retry.MaxBackoff) * time.Millisecond,
