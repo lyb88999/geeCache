@@ -7,14 +7,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/lyb88999/geeCache/admin"
+	"github.com/lyb88999/geeCache/circuitbreaker"
 	"github.com/lyb88999/geeCache/config"
 	"github.com/lyb88999/geeCache/geeCache"
 	"github.com/lyb88999/geeCache/health"
 	"github.com/lyb88999/geeCache/logger"
+	"github.com/lyb88999/geeCache/metrics"
+	"github.com/lyb88999/geeCache/ratelimit"
 	"github.com/lyb88999/geeCache/registry"
+	"github.com/lyb88999/geeCache/retry"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -50,8 +57,18 @@ func main() {
 
 	log := logger.GetLogger()
 	log.Info("starting GeeCache",
-		zap.String("version", "1.0.0"),
-		zap.Any("config", cfg))
+		zap.String("version", "2.0.0"),
+		zap.String("instance_id", cfg.Server.InstanceID))
+
+	// 初始化 Prometheus metrics
+	var metricsCollector *metrics.Metrics
+	if cfg.Metrics.Enabled {
+		metricsCollector = metrics.Init(cfg.Metrics.Namespace)
+		log.Info("metrics initialized", zap.String("namespace", cfg.Metrics.Namespace))
+
+		// 启动系统指标更新
+		go updateSystemMetrics(metricsCollector)
+	}
 
 	// 如果没有指定instanceID，使用默认值
 	if cfg.Server.InstanceID == "" {
@@ -60,6 +77,49 @@ func main() {
 
 	// 构建当前节点地址
 	addr := fmt.Sprintf("http://localhost:%d", cfg.Server.Port)
+
+	// 初始化重试器
+	var retryer *retry.Retryer
+	if cfg.Retry.Enabled {
+		retryer = retry.NewRetryer(&retry.Config{
+			MaxRetries:     cfg.Retry.MaxRetries,
+			InitialBackoff: time.Duration(cfg.Retry.InitialBackoff) * time.Millisecond,
+			MaxBackoff:     time.Duration(cfg.Retry.MaxBackoff) * time.Millisecond,
+			Multiplier:     cfg.Retry.Multiplier,
+		}, log)
+		log.Info("retry enabled", zap.Int("max_retries", cfg.Retry.MaxRetries))
+	}
+
+	// 初始化熔断器
+	var breaker *circuitbreaker.CircuitBreaker
+	if cfg.CircuitBreaker.Enabled {
+		breaker = circuitbreaker.NewCircuitBreaker(&circuitbreaker.Config{
+			MaxRequests:      cfg.CircuitBreaker.MaxRequests,
+			Interval:         time.Duration(cfg.CircuitBreaker.Interval) * time.Second,
+			Timeout:          time.Duration(cfg.CircuitBreaker.Timeout) * time.Second,
+			FailureThreshold: cfg.CircuitBreaker.FailureThreshold,
+			MinimumRequests:  cfg.CircuitBreaker.MinimumRequests,
+			OnStateChange: func(from, to circuitbreaker.State) {
+				log.Warn("circuit breaker state changed",
+					zap.String("from", from.String()),
+					zap.String("to", to.String()))
+			},
+		}, log)
+		log.Info("circuit breaker enabled",
+			zap.Float64("failure_threshold", cfg.CircuitBreaker.FailureThreshold))
+	}
+
+	// 初始化限流器
+	var limiter ratelimit.Limiter
+	if cfg.RateLimit.Enabled {
+		limiter = ratelimit.NewTokenBucketLimiter(&ratelimit.Config{
+			Rate:  cfg.RateLimit.Rate,
+			Burst: cfg.RateLimit.Burst,
+		}, log)
+		log.Info("rate limiter enabled",
+			zap.Int("rate", cfg.RateLimit.Rate),
+			zap.Int("burst", cfg.RateLimit.Burst))
+	}
 
 	// 根据缓存类型选择相应的策略
 	var strategyFactory geeCache.CacheStrategyFactory
@@ -75,14 +135,54 @@ func main() {
 		strategyFactory = geeCache.NewLRUCache
 	}
 
-	// 创建缓存组
-	gee := geeCache.NewGroupWithStrategy(cfg.Cache.GroupName, cfg.Cache.MaxBytes, geeCache.GetterFunc(
-		func(key string) ([]byte, error) {
+	// 创建缓存组（带重试和熔断）
+	gee := geeCache.NewGroupWithStrategy(cfg.Cache.GroupName, cfg.Cache.MaxBytes,
+		geeCache.GetterFunc(func(key string) ([]byte, error) {
+			start := time.Now()
 			log.Info("searching in slow db", zap.String("key", key))
-			if v, ok := db[key]; ok {
-				return []byte(v), nil
+
+			// 应用限流
+			if limiter != nil {
+				if !limiter.Allow() {
+					log.Warn("rate limit exceeded", zap.String("key", key))
+					if metricsCollector != nil {
+						metricsCollector.RecordRequest(cfg.Cache.GroupName, "rate_limited", time.Since(start))
+					}
+					return nil, ratelimit.ErrRateLimitExceeded
+				}
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+
+			// 数据库查询逻辑
+			dbQuery := func() error {
+				// 模拟数据库查询
+				if _, ok := db[key]; !ok {
+					return fmt.Errorf("%s not exist", key)
+				}
+				return nil
+			}
+
+			var queryErr error
+
+			// 应用熔断器
+			if breaker != nil {
+				queryErr = breaker.Execute(dbQuery)
+			} else {
+				queryErr = dbQuery()
+			}
+
+			if queryErr != nil {
+				if metricsCollector != nil {
+					metricsCollector.RecordRequest(cfg.Cache.GroupName, "error", time.Since(start))
+				}
+				return nil, queryErr
+			}
+
+			// 记录成功的指标
+			if metricsCollector != nil {
+				metricsCollector.RecordRequest(cfg.Cache.GroupName, "success", time.Since(start))
+			}
+
+			return []byte(db[key]), nil
 		}), strategyFactory)
 
 	// 创建HTTP连接池配置
@@ -121,21 +221,44 @@ func main() {
 
 	// 注册健康检查
 	healthChecker.RegisterCheck(health.NewSimpleCheck("cache", func(ctx context.Context) error {
-		// 简单检查：尝试获取一个键
 		_, err := gee.Get("Tom")
 		return err
 	}))
 
 	healthChecker.RegisterCheck(health.NewSimpleCheck("registry", func(ctx context.Context) error {
-		// 检查注册中心连接
 		_, err := reg.Discover(ctx, cfg.Registry.ServiceName)
 		return err
 	}))
 
+	if breaker != nil {
+		healthChecker.RegisterCheck(health.NewSimpleCheck("circuit_breaker", func(ctx context.Context) error {
+			state := breaker.State()
+			if state == circuitbreaker.StateOpen {
+				return fmt.Errorf("circuit breaker is open")
+			}
+			return nil
+		}))
+	}
+
 	// 设置元数据
-	healthChecker.SetMetadata("version", "1.0.0")
+	healthChecker.SetMetadata("version", "2.0.0")
 	healthChecker.SetMetadata("instance_id", cfg.Server.InstanceID)
 	healthChecker.SetMetadata("cache_strategy", cfg.Cache.Strategy)
+	healthChecker.SetMetadata("features", map[string]bool{
+		"metrics":         cfg.Metrics.Enabled,
+		"circuit_breaker": cfg.CircuitBreaker.Enabled,
+		"retry":           cfg.Retry.Enabled,
+		"rate_limit":      cfg.RateLimit.Enabled,
+		"admin_api":       cfg.Admin.Enabled,
+	})
+
+	// 创建管理 API
+	var adminAPI *admin.API
+	if cfg.Admin.Enabled {
+		adminAPI = admin.NewAPI(log)
+		adminAPI.RegisterGroup(cfg.Cache.GroupName, gee)
+		log.Info("admin API enabled", zap.String("endpoint", cfg.Admin.Endpoint))
+	}
 
 	// 创建HTTP服务器
 	mux := http.NewServeMux()
@@ -149,19 +272,40 @@ func main() {
 		log.Info("health check enabled", zap.String("endpoint", cfg.Health.Endpoint))
 	}
 
+	// 注册 Prometheus metrics 端点
+	if cfg.Metrics.Enabled {
+		mux.Handle(cfg.Metrics.Endpoint, promhttp.Handler())
+		log.Info("metrics enabled", zap.String("endpoint", cfg.Metrics.Endpoint))
+	}
+
+	// 注册管理 API 端点
+	if cfg.Admin.Enabled && adminAPI != nil {
+		adminAPI.RegisterHandlers(mux, cfg.Admin.Endpoint)
+	}
+
 	// API服务器
 	var apiServer *http.Server
 	if cfg.Server.EnableAPI {
 		apiMux := http.NewServeMux()
 		apiMux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
 			key := r.URL.Query().Get("key")
 			log.Info("api request", zap.String("key", key))
 
 			view, err := gee.Get(key)
+			duration := time.Since(start)
+
 			if err != nil {
 				log.Error("failed to get value", zap.String("key", key), zap.Error(err))
+				if metricsCollector != nil {
+					metricsCollector.RecordRequest(cfg.Cache.GroupName, "error", duration)
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+
+			if metricsCollector != nil {
+				metricsCollector.RecordRequest(cfg.Cache.GroupName, "success", duration)
 			}
 
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -200,7 +344,10 @@ func main() {
 
 	log.Info("GeeCache started successfully",
 		zap.String("instance_id", cfg.Server.InstanceID),
-		zap.Int("port", cfg.Server.Port))
+		zap.Int("port", cfg.Server.Port),
+		zap.String("health", cfg.Health.Endpoint),
+		zap.String("metrics", cfg.Metrics.Endpoint),
+		zap.String("admin", cfg.Admin.Endpoint))
 
 	// 等待中断信号以优雅关闭
 	quit := make(chan os.Signal, 1)
@@ -235,5 +382,15 @@ func main() {
 		log.Error("failed to close registry", zap.Error(err))
 	}
 
-	log.Info("server exited")
+	log.Info("server exited cleanly")
+}
+
+// updateSystemMetrics 定期更新系统指标
+func updateSystemMetrics(m *metrics.Metrics) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		m.UpdateSystemMetrics(runtime.NumGoroutine())
+	}
 }

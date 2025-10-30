@@ -1,4 +1,4 @@
-# GeeCache 配置文件示例
+# GeeCache 配置文件
 
 # 服务器配置
 server:
@@ -21,7 +21,7 @@ cache:
 
 # 注册中心配置
 registry:
-  endpoints: # etcd 地址列表
+  endpoints:                      # etcd 地址列表
     - localhost:2379
   dial_timeout: 5s                # 连接超时
   username: ""                    # 用户名（可选）
@@ -39,3 +39,37 @@ log:
 health:
   enabled: true                   # 是否启用健康检查
   endpoint: "/health"             # 健康检查端点
+
+# 监控指标配置
+metrics:
+  enabled: true                   # 是否启用 Prometheus 监控
+  endpoint: "/metrics"            # 监控指标端点
+  namespace: "geecache"           # 指标命名空间
+
+# 熔断器配置
+circuit_breaker:
+  enabled: true                   # 是否启用熔断器
+  max_requests: 10                # 半开状态下允许的最大请求数
+  interval: 10                    # 统计时间窗口(秒)
+  timeout: 60                     # 打开状态持续时间(秒)
+  failure_threshold: 0.5          # 失败率阈值(0-1)，50%失败则熔断
+  minimum_requests: 10            # 最小请求数，低于此值不触发熔断
+
+# 重试配置
+retry:
+  enabled: true                   # 是否启用重试
+  max_retries: 3                  # 最大重试次数
+  initial_backoff: 100            # 初始退避时间(毫秒)
+  max_backoff: 5000               # 最大退避时间(毫秒)
+  multiplier: 2.0                 # 退避时间倍数（指数退避）
+
+# 限流配置
+rate_limit:
+  enabled: true                   # 是否启用限流
+  rate: 1000                      # 每秒允许的请求数
+  burst: 1500                     # 突发请求数
+
+# 管理API配置
+admin:
+  enabled: true                   # 是否启用管理API
+  endpoint: "/admin"              # 管理API端点
