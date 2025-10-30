@@ -97,7 +97,7 @@ func (e *EtcdRegistry) Unregister(ctx context.Context, serviceName, instanceID s
 
 func (e *EtcdRegistry) Discover(ctx context.Context, serviceName string) (map[string]string, error) {
 	prefix := e.makeServicePrefix(serviceName)
-	resp, err := e.client.Get(ctx, prefix, clientv3.WithLease(e.leaseID))
+	resp, err := e.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover service: %w", err)
 	}

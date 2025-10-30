@@ -4,7 +4,7 @@ import (
 	bytes2 "bytes"
 	"fmt"
 	"github.com/lyb88999/geeCache/singleFlight"
-	"log"
+	"go.uber.org/zap"
 	"sync"
 )
 
@@ -13,8 +13,6 @@ type Getter interface {
 }
 
 // GetterFunc 接口型函数
-// 定义一个函数类型 F，并且实现接口 A 的方法，然后在这个方法中调用自己。
-// 这是 Go 语言中将其他函数（参数返回值定义与 F 一致）转换为接口 A 的常用技巧。
 type GetterFunc func(key string) ([]byte, error)
 
 func (f GetterFunc) Get(key string) ([]byte, error) {
@@ -23,11 +21,12 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 
 // Group 一个Group可以认为是一个缓存的命名空间
 type Group struct {
-	name      string     // 每个Group拥有一个唯一的名称name
-	getter    Getter     // 缓存未命中时获取数据的回调
-	mainCache cache      // 实现的并发缓存
-	peers     PeerPicker // 分布式节点选择
-	loader    *singleFlight.Group
+	name      string              // 每个Group拥有一个唯一的名称name
+	getter    Getter              // 缓存未命中时获取数据的回调
+	mainCache cache               // 实现的并发缓存
+	peers     PeerPicker          // 分布式节点选择
+	loader    *singleFlight.Group // 防止缓存击穿
+	logger    *zap.Logger         // 日志记录器
 }
 
 var (
@@ -48,6 +47,10 @@ func NewGroupWithStrategy(name string, cacheBytes int64, getter Getter, factory 
 		panic("getter is nil!")
 	}
 
+	logger := zap.L().With(
+		zap.String("component", "cache_group"),
+		zap.String("group", name))
+
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
@@ -58,8 +61,13 @@ func NewGroupWithStrategy(name string, cacheBytes int64, getter Getter, factory 
 			factory:    factory,
 		},
 		loader: &singleFlight.Group{},
+		logger: logger,
 	}
 	groups[name] = g
+
+	logger.Info("created cache group",
+		zap.Int64("max_bytes", cacheBytes))
+
 	return g
 }
 
@@ -69,6 +77,7 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 		panic("RegisterPeerPicker called more than once")
 	}
 	g.peers = peers
+	g.logger.Info("registered peer picker")
 }
 
 func GetGroup(name string) *Group {
@@ -82,12 +91,15 @@ func (g *Group) Get(key string) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
+
 	// 命中缓存
 	if v, ok := g.mainCache.get(key); ok {
-		log.Println("[GeeCache] hit")
+		g.logger.Debug("cache hit", zap.String("key", key))
 		return v, nil
 	}
+
 	// 未命中缓存
+	g.logger.Debug("cache miss", zap.String("key", key))
 	return g.load(key)
 }
 
@@ -95,21 +107,26 @@ func (g *Group) load(key string) (value ByteView, err error) {
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
 		if g.peers != nil {
 			if peer, ok := g.peers.PickPeer(key); ok {
-				if value, err = g.getFromPeer(peer, key); err == nil {
+				value, err := g.getFromPeer(peer, key)
+				if err == nil {
+					g.logger.Debug("loaded from peer", zap.String("key", key))
 					return value, nil
 				}
+				g.logger.Warn("failed to get from peer",
+					zap.String("key", key),
+					zap.Error(err))
 			}
-			log.Println("[GeeCache] failed to get from peer: ", err)
 		}
 		return g.getLocally(key)
 	})
+
 	if err == nil {
 		return viewi.(ByteView), err
 	}
 	return
 }
 
-// 使用实现了PeerGetter接口的httpGetter从远程节点获取缓存值
+// getFromPeer 使用实现了PeerGetter接口的httpGetter从远程节点获取缓存值
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	bytes, err := peer.Get(g.name, key)
 	if err != nil {
@@ -119,12 +136,23 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 }
 
 func (g *Group) getLocally(key string) (value ByteView, err error) {
+	g.logger.Debug("loading from local getter", zap.String("key", key))
+
 	bytes, err := g.getter.Get(key)
 	if err != nil {
+		g.logger.Error("failed to load from getter",
+			zap.String("key", key),
+			zap.Error(err))
 		return ByteView{}, err
 	}
+
 	value = ByteView{b: bytes2.Clone(bytes)}
 	g.populateCache(key, value)
+
+	g.logger.Debug("loaded from local getter",
+		zap.String("key", key),
+		zap.Int("size", len(bytes)))
+
 	return value, nil
 }
 
